@@ -91,7 +91,7 @@ static int mptcp_v4_init_req(struct request_sock *req, struct sock *sk,
 	 * input to the key-generation.
 	 */
 	if (!want_cookie)
-		mptcp_reqsk_init(req, sk, skb, false);
+		mptcp_reqsk_init(req, skb, false);
 
 	return 0;
 }
@@ -104,7 +104,7 @@ static u32 mptcp_v4_cookie_init_seq(struct request_sock *req, struct sock *sk,
 
 	tcp_rsk(req)->snt_isn = isn;
 
-	mptcp_reqsk_init(req, sk, skb, true);
+	mptcp_reqsk_init(req, skb, true);
 
 	return isn;
 }
@@ -162,7 +162,24 @@ static void mptcp_v4_reqsk_queue_hash_add(struct sock *meta_sk,
 	const u32 h1 = inet_synq_hash(inet_rsk(req)->ir_rmt_addr,
 				     inet_rsk(req)->ir_rmt_port,
 				     0, MPTCP_HASH_SIZE);
-	inet_csk_reqsk_queue_hash_add(meta_sk, req, timeout);
+	/* We cannot call inet_csk_reqsk_queue_hash_add(), because we do not
+	 * want to reset the keepalive-timer (responsible for retransmitting
+	 * SYN/ACKs). We do not retransmit SYN/ACKs+MP_JOINs, because we cannot
+	 * overload the keepalive timer. Also, it's not a big deal, because the
+	 * third ACK of the MP_JOIN-handshake is sent in a reliable manner. So,
+	 * if the third ACK gets lost, the client will handle the retransmission
+	 * anyways. If our SYN/ACK gets lost, the client will retransmit the
+	 * SYN.
+	 */
+	struct inet_connection_sock *meta_icsk = inet_csk(meta_sk);
+	struct listen_sock *lopt = meta_icsk->icsk_accept_queue.listen_opt;
+	const u32 h2 = inet_synq_hash(inet_rsk(req)->ir_rmt_addr,
+				     inet_rsk(req)->ir_rmt_port,
+				     lopt->hash_rnd, lopt->nr_table_entries);
+
+	reqsk_queue_hash_req(&meta_icsk->icsk_accept_queue, h2, req, timeout);
+	if (reqsk_queue_added(&meta_icsk->icsk_accept_queue) == 0)
+		mptcp_reset_synack_timer(meta_sk, timeout);
 
 	rcu_read_lock();
 	spin_lock(&mptcp_reqsk_hlock);
@@ -261,18 +278,20 @@ reset_and_discard:
 	if (reqsk_queue_len(&inet_csk(meta_sk)->icsk_accept_queue)) {
 		const struct tcphdr *th = tcp_hdr(skb);
 		const struct iphdr *iph = ip_hdr(skb);
-		struct request_sock *req;
+		struct request_sock **prev, *req;
 		/* If we end up here, it means we should not have matched on the
 		 * request-socket. But, because the request-sock queue is only
 		 * destroyed in mptcp_close, the socket may actually already be
 		 * in close-state (e.g., through shutdown()) while still having
 		 * pending request sockets.
 		 */
-		req = inet_csk_search_req(meta_sk, th->source, iph->saddr, iph->daddr);
-
+		req = inet_csk_search_req(meta_sk, &prev, th->source,
+					  iph->saddr, iph->daddr);
 		if (req) {
-			inet_csk_reqsk_queue_drop(meta_sk, req);
-			reqsk_put(req);
+			inet_csk_reqsk_queue_unlink(meta_sk, req, prev);
+			reqsk_queue_removed(&inet_csk(meta_sk)->icsk_accept_queue,
+					    req);
+			reqsk_free(req);
 		}
 	}
 
@@ -380,9 +399,6 @@ int mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	loc_in.sin_addr = loc->addr;
 	rem_in.sin_addr = rem->addr;
 
-	if (loc->if_idx)
-		sk->sk_bound_dev_if = loc->if_idx;
-
 	ret = sock.ops->bind(&sock, (struct sockaddr *)&loc_in, sizeof(struct sockaddr_in));
 	if (ret < 0) {
 		mptcp_debug("%s: MPTCP subsocket bind() failed, error %d\n",
@@ -390,11 +406,11 @@ int mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 		goto error;
 	}
 
-	mptcp_debug("%s: token %#x pi %d src_addr:%pI4:%d dst_addr:%pI4:%d ifidx: %d\n",
+	mptcp_debug("%s: token %#x pi %d src_addr:%pI4:%d dst_addr:%pI4:%d\n",
 		    __func__, tcp_sk(meta_sk)->mpcb->mptcp_loc_token,
 		    tp->mptcp->path_index, &loc_in.sin_addr,
 		    ntohs(loc_in.sin_port), &rem_in.sin_addr,
-		    ntohs(rem_in.sin_port), loc->if_idx);
+		    ntohs(rem_in.sin_port));
 
 	if (tcp_sk(meta_sk)->mpcb->pm_ops->init_subsocket_v4)
 		tcp_sk(meta_sk)->mpcb->pm_ops->init_subsocket_v4(sk, rem->addr);

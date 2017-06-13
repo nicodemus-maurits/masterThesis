@@ -53,10 +53,59 @@
 	#define htonll(x) (x)
 #endif
 
+
+// Redundant Output Sockets
+ #define MAX_NUM_RED_SK 20
+
+struct red_sk {
+	struct sock *sk;
+	bool available;
+	ktime_t last_used;
+	ktime_t avg_wait;
+	unsigned int seg_count;
+	unsigned int byte_count;
+};
+
+struct redundant_socket_register {
+	struct sock *meta_sk;
+	ktime_t last_update;
+	unsigned int sk_list_size;
+	struct red_sk sk_list[MAX_NUM_RED_SK];
+}; 
+
+
+extern struct redundant_socket_register red_sk_reg;
+
+
+// Redundant Input Sockets
+#define MAX_NUM_RED_IN_SK 100
+#define ONE_SEC 1000000000
+#define MICRO2NS 1000
+#define NS2MILLI 1000000
+
+struct red_in_sk {
+	struct sock *sk;
+	u32 dsn;
+	bool dsn_send;
+};
+
+
+
+struct rmptcp_lowpass_queue {
+	int queue_head;
+	int queue_tail;
+	struct red_in_sk sk_list[MAX_NUM_RED_IN_SK];
+};
+
+//extern struct rmptcp_lowpass_queue red_lp_queue;
+
+
+extern u64 learned_timeout; // in ns
+
+
 struct mptcp_loc4 {
 	u8		loc4_id;
 	u8		low_prio:1;
-	int		if_idx;
 	struct in_addr	addr;
 };
 
@@ -69,7 +118,6 @@ struct mptcp_rem4 {
 struct mptcp_loc6 {
 	u8		loc6_id;
 	u8		low_prio:1;
-	int		if_idx;
 	struct in6_addr	addr;
 };
 
@@ -109,8 +157,7 @@ struct mptcp_request_sock {
 	u8				dss_csum:1,
 					is_sub:1, /* Is this a new subflow? */
 					low_prio:1, /* Interface set to low-prio? */
-					rcv_low_prio:1,
-					mptcp_ver:4;
+					rcv_low_prio:1;
 };
 
 struct mptcp_options_received {
@@ -146,13 +193,11 @@ struct mptcp_options_received {
 	u32	data_seq;
 	u16	data_len;
 
-	u8	mptcp_ver; /* MPTCP version */
+	u32	mptcp_rem_token;/* Remote token */
 
 	/* Key inside the option (from mp_capable or fast_close) */
 	u64	mptcp_sender_key;
 	u64	mptcp_receiver_key;
-
-	u32	mptcp_rem_token; /* Remote token */
 
 	u32	mptcp_recv_nonce;
 	u64	mptcp_recv_tmac;
@@ -191,7 +236,7 @@ struct mptcp_tcp_sock {
 	u8	loc_id;
 	u8	rem_id;
 
-#define MPTCP_SCHED_SIZE 16
+#define MPTCP_SCHED_SIZE 4
 	u8	mptcp_sched[MPTCP_SCHED_SIZE] __aligned(8);
 
 	struct sk_buff  *shortcut_ofoqueue; /* Shortcut to the current modified
@@ -256,7 +301,6 @@ struct mptcp_sched_ops {
 						struct sock **subsk,
 						unsigned int *limit);
 	void			(*init)(struct sock *sk);
-	void			(*release)(struct sock *sk);
 
 	char			name[MPTCP_SCHED_NAME_MAX];
 	struct module		*owner;
@@ -289,8 +333,6 @@ struct mptcp_cb {
 	u8 cnt_subflows;
 	u8 cnt_established;
 
-#define MPTCP_SCHED_DATA_SIZE 8
-	u8 mptcp_sched[MPTCP_SCHED_DATA_SIZE] __aligned(8);
 	struct mptcp_sched_ops *sched_ops;
 
 	struct sk_buff_head reinject_queue;
@@ -339,8 +381,6 @@ struct mptcp_cb {
 	/* Next pi to pick up in case a new path becomes available */
 	u8 next_path_index;
 
-	__u8	mptcp_ver;
-
 	/* Original snd/rcvbuf of the initial subflow.
 	 * Used for the new subflows on the server-side to allow correct
 	 * autotuning
@@ -348,10 +388,11 @@ struct mptcp_cb {
 	int orig_sk_rcvbuf;
 	int orig_sk_sndbuf;
 	u32 orig_window_clamp;
+
+	/* Timer for retransmitting SYN/ACK+MP_JOIN */
+	struct timer_list synack_timer;
 };
 
-#define MPTCP_VERSION_0 0
-#define MPTCP_VERSION_1 1
 
 #define MPTCP_SUB_CAPABLE			0
 #define MPTCP_SUB_LEN_CAPABLE_SYN		12
@@ -403,13 +444,9 @@ struct mptcp_cb {
 
 #define MPTCP_SUB_ADD_ADDR		3
 #define MPTCP_SUB_LEN_ADD_ADDR4		8
-#define MPTCP_SUB_LEN_ADD_ADDR4_VER1	16
 #define MPTCP_SUB_LEN_ADD_ADDR6		20
-#define MPTCP_SUB_LEN_ADD_ADDR6_VER1	28
 #define MPTCP_SUB_LEN_ADD_ADDR4_ALIGN	8
-#define MPTCP_SUB_LEN_ADD_ADDR4_ALIGN_VER1	16
 #define MPTCP_SUB_LEN_ADD_ADDR6_ALIGN	20
-#define MPTCP_SUB_LEN_ADD_ADDR6_ALIGN_VER1	28
 
 #define MPTCP_SUB_REMOVE_ADDR	4
 #define MPTCP_SUB_LEN_REMOVE_ADDR	4
@@ -573,12 +610,10 @@ struct mp_add_addr {
 		struct {
 			struct in_addr	addr;
 			__be16		port;
-			__u8		mac[8];
 		} v4;
 		struct {
 			struct in6_addr	addr;
 			__be16		port;
-			__u8		mac[8];
 		} v6;
 	} u;
 } __attribute__((__packed__));
@@ -658,10 +693,16 @@ static inline int mptcp_sub_len_dss(const struct mp_dss *m, const int csum)
 #define MPTCP_SYSCTL	1
 
 extern int sysctl_mptcp_enabled;
-extern int sysctl_mptcp_version;
 extern int sysctl_mptcp_checksum;
 extern int sysctl_mptcp_debug;
 extern int sysctl_mptcp_syn_retries;
+extern int sysctl_rmptcp_quota; 
+extern int sysctl_sk_reg_update_period;
+extern int sysctl_max_sk_noshow;
+extern int sysctl_red_timeout;
+extern int sysctl_lowpass_max_wait;
+extern int sysctl_lowpass_learn_rate;
+extern int sysctl_lowpass_threshold;
 
 extern struct workqueue_struct *mptcp_wq;
 
@@ -804,8 +845,7 @@ void tcp_parse_mptcp_options(const struct sk_buff *skb,
 			     struct mptcp_options_received *mopt);
 void mptcp_parse_options(const uint8_t *ptr, int opsize,
 			 struct mptcp_options_received *mopt,
-			 const struct sk_buff *skb,
-			 struct tcp_sock *tp);
+			 const struct sk_buff *skb);
 void mptcp_syn_options(const struct sock *sk, struct tcp_out_options *opts,
 		       unsigned *remaining);
 void mptcp_synack_options(struct request_sock *req,
@@ -818,13 +858,14 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 			 struct sk_buff *skb);
 void mptcp_close(struct sock *meta_sk, long timeout);
 int mptcp_doit(struct sock *sk);
-int mptcp_create_master_sk(struct sock *meta_sk, __u64 remote_key,
-			   __u8 mptcp_ver, u32 window);
+int mptcp_create_master_sk(struct sock *meta_sk, __u64 remote_key, u32 window);
 int mptcp_check_req_fastopen(struct sock *child, struct request_sock *req);
 int mptcp_check_req_master(struct sock *sk, struct sock *child,
-			   struct request_sock *req, int drop);
+			   struct request_sock *req,
+			   struct request_sock **prev);
 struct sock *mptcp_check_req_child(struct sock *sk, struct sock *child,
 				   struct request_sock *req,
+				   struct request_sock **prev,
 				   const struct mptcp_options_received *mopt);
 u32 __mptcp_select_window(struct sock *sk);
 void mptcp_select_initial_window(int __space, __u32 mss, __u32 *rcv_wnd,
@@ -834,11 +875,11 @@ void mptcp_select_initial_window(int __space, __u32 mss, __u32 *rcv_wnd,
 unsigned int mptcp_current_mss(struct sock *meta_sk);
 int mptcp_select_size(const struct sock *meta_sk, bool sg);
 void mptcp_key_sha1(u64 key, u32 *token, u64 *idsn);
-void mptcp_hmac_sha1(u8 *key_1, u8 *key_2, u32 *hash_out, int arg_num, ...);
+void mptcp_hmac_sha1(u8 *key_1, u8 *key_2, u8 *rand_1, u8 *rand_2,
+		     u32 *hash_out);
 void mptcp_clean_rtx_infinite(const struct sk_buff *skb, struct sock *sk);
 void mptcp_fin(struct sock *meta_sk);
-void mptcp_meta_retransmit_timer(struct sock *meta_sk);
-void mptcp_sub_retransmit_timer(struct sock *sk);
+void mptcp_retransmit_timer(struct sock *meta_sk);
 int mptcp_write_wakeup(struct sock *meta_sk);
 void mptcp_sub_close_wq(struct work_struct *work);
 void mptcp_sub_close(struct sock *sk, unsigned long delay);
@@ -851,6 +892,7 @@ int mptcp_check_snd_buf(const struct tcp_sock *tp);
 int mptcp_handle_options(struct sock *sk, const struct tcphdr *th,
 			 const struct sk_buff *skb);
 void __init mptcp_init(void);
+int mptcp_trim_head(struct sock *sk, struct sk_buff *skb, u32 len);
 void mptcp_destroy_sock(struct sock *sk);
 int mptcp_rcv_synsent_state_process(struct sock *sk, struct sock **skptr,
 				    const struct sk_buff *skb,
@@ -883,8 +925,8 @@ void mptcp_remove_shortcuts(const struct mptcp_cb *mpcb,
 void mptcp_init_buffer_space(struct sock *sk);
 void mptcp_join_reqsk_init(struct mptcp_cb *mpcb, const struct request_sock *req,
 			   struct sk_buff *skb);
-void mptcp_reqsk_init(struct request_sock *req, struct sock *sk,
-		      const struct sk_buff *skb, bool want_cookie);
+void mptcp_reqsk_init(struct request_sock *req, const struct sk_buff *skb,
+		      bool want_cookie);
 int mptcp_conn_request(struct sock *sk, struct sk_buff *skb);
 void mptcp_enable_sock(struct sock *sk);
 void mptcp_disable_sock(struct sock *sk);
@@ -912,13 +954,6 @@ void mptcp_init_scheduler(struct mptcp_cb *mpcb);
 void mptcp_cleanup_scheduler(struct mptcp_cb *mpcb);
 void mptcp_get_default_scheduler(char *name);
 int mptcp_set_default_scheduler(const char *name);
-bool mptcp_is_available(struct sock *sk, const struct sk_buff *skb,
-			bool zero_wnd_test);
-bool mptcp_is_def_unavailable(struct sock *sk);
-bool subflow_is_active(const struct tcp_sock *tp);
-bool subflow_is_backup(const struct tcp_sock *tp);
-struct sock *get_available_subflow(struct sock *meta_sk, struct sk_buff *skb,
-				   bool zero_wnd_test);
 extern struct mptcp_sched_ops mptcp_sched_default;
 
 /* Initializes function-pointers and MPTCP-flags */
@@ -926,6 +961,18 @@ static inline void mptcp_init_tcp_sock(struct sock *sk)
 {
 	if (!mptcp_init_failed && sysctl_mptcp_enabled == MPTCP_SYSCTL)
 		mptcp_enable_sock(sk);
+}
+
+static inline void mptcp_reset_synack_timer(struct sock *meta_sk,
+					    unsigned long len)
+{
+	sk_reset_timer(meta_sk, &tcp_sk(meta_sk)->mpcb->synack_timer,
+		       jiffies + len);
+}
+
+static inline void mptcp_delete_synack_timer(struct sock *meta_sk)
+{
+	sk_stop_timer(meta_sk, &tcp_sk(meta_sk)->mpcb->synack_timer);
 }
 
 static inline int mptcp_pi_to_flag(int pi)
@@ -1400,9 +1447,8 @@ static inline void mptcp_sub_close(struct sock *sk, unsigned long delay) {}
 static inline void mptcp_set_rto(const struct sock *sk) {}
 static inline void mptcp_send_fin(const struct sock *meta_sk) {}
 static inline void mptcp_parse_options(const uint8_t *ptr, const int opsize,
-				       struct mptcp_options_received *mopt,
-				       const struct sk_buff *skb,
-				       const struct tcp_sock *tp) {}
+				       const struct mptcp_options_received *mopt,
+				       const struct sk_buff *skb) {}
 static inline void mptcp_syn_options(const struct sock *sk,
 				     struct tcp_out_options *opts,
 				     unsigned *remaining) {}
@@ -1430,18 +1476,23 @@ static inline int mptcp_check_req_fastopen(struct sock *child,
 static inline int mptcp_check_req_master(const struct sock *sk,
 					 const struct sock *child,
 					 struct request_sock *req,
-					 int drop)
+					 struct request_sock **prev)
 {
 	return 1;
 }
 static inline struct sock *mptcp_check_req_child(struct sock *sk,
 						 struct sock *child,
 						 struct request_sock *req,
+						 struct request_sock **prev,
 						 const struct mptcp_options_received *mopt)
 {
 	return NULL;
 }
 static inline unsigned int mptcp_current_mss(struct sock *meta_sk)
+{
+	return 0;
+}
+static inline int mptcp_select_size(const struct sock *meta_sk, bool sg)
 {
 	return 0;
 }
@@ -1468,6 +1519,10 @@ static inline int mptcp_handle_options(struct sock *sk,
 }
 static inline void mptcp_reset_mopt(struct tcp_sock *tp) {}
 static inline void  __init mptcp_init(void) {}
+static inline int mptcp_trim_head(struct sock *sk, struct sk_buff *skb, u32 len)
+{
+	return 0;
+}
 static inline bool mptcp_sk_can_gso(const struct sock *sk)
 {
 	return false;
@@ -1506,6 +1561,7 @@ static inline void mptcp_hash_remove_bh(struct tcp_sock *meta_tp) {}
 static inline void mptcp_hash_remove(struct tcp_sock *meta_tp) {}
 static inline void mptcp_remove_shortcuts(const struct mptcp_cb *mpcb,
 					  const struct sk_buff *skb) {}
+static inline void mptcp_delete_synack_timer(struct sock *meta_sk) {}
 static inline void mptcp_init_tcp_sock(struct sock *sk) {}
 static inline void mptcp_disable_static_key(void) {}
 static inline void mptcp_cookies_reqsk_init(struct request_sock *req,

@@ -36,11 +36,6 @@
 #include <linux/kconfig.h>
 
 u64 learned_timeout = 200000000; // 200 ms in ns
-float kalmanGain;
-float newErrorEstimate; 
-#define initialErrorEstimate 5;	//it can be any random value, the result would still likely be the same.
-#define initialEstimate 0; // since we do not have any estimation value before, it set to zero.
-
 struct rmptcp_lowpass_queue red_lp_queue = { .queue_tail = 0, .queue_head = 0 };
 
 bool rmptcp_add_to_sk_queue(struct sock *sk, struct sk_buff *skb)
@@ -1126,7 +1121,7 @@ bool rmptcp_calc_lowpass_timeout(struct sock *sk)
 	static int da_i = 0;
 	static u32 delta_mean = 0;
 	u32 delta_mean_max = 0;
-	u32 threshold = 0;
+
 
 	nowT = ktime_get();
 

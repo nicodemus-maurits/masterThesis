@@ -52,7 +52,6 @@ struct mptcp_addr_event {
 	unsigned short	family;
 	u8	code:7,
 		low_prio:1;
-	int	if_idx;
 	union inet_addr addr;
 };
 
@@ -472,14 +471,13 @@ next_subflow:
 	lock_sock_nested(meta_sk, SINGLE_DEPTH_NESTING);
 
 	/* Create the additional subflows for the first pair */
-	if (fmp->first_pair == 0 && mpcb->master_sk) {
+	if (fmp->first_pair == 0) {
 		struct mptcp_loc4 loc;
 		struct mptcp_rem4 rem;
 
 		loc.addr.s_addr = inet_sk(meta_sk)->inet_saddr;
 		loc.loc4_id = 0;
 		loc.low_prio = 0;
-		loc.if_idx = mpcb->master_sk->sk_bound_dev_if;
 
 		rem.addr.s_addr = inet_sk(meta_sk)->inet_daddr;
 		rem.port = inet_sk(meta_sk)->inet_dport;
@@ -529,14 +527,13 @@ next_subflow:
 	}
 
 #if IS_ENABLED(CONFIG_IPV6)
-	if (fmp->first_pair == 0 && mpcb->master_sk) {
+	if (fmp->first_pair == 0) {
 			struct mptcp_loc6 loc;
 			struct mptcp_rem6 rem;
 
 			loc.addr = inet6_sk(meta_sk)->saddr;
 			loc.loc6_id = 0;
 			loc.low_prio = 0;
-			loc.if_idx = mpcb->master_sk->sk_bound_dev_if;
 
 			rem.addr = meta_sk->sk_v6_daddr;
 			rem.port = inet_sk(meta_sk)->inet_dport;
@@ -630,8 +627,7 @@ static void update_addr_bitfields(struct sock *meta_sk,
 }
 
 static int mptcp_find_address(const struct mptcp_loc_addr *mptcp_local,
-			      sa_family_t family, const union inet_addr *addr,
-			      int if_idx)
+			      sa_family_t family, const union inet_addr *addr)
 {
 	int i;
 	u8 loc_bits;
@@ -644,13 +640,11 @@ static int mptcp_find_address(const struct mptcp_loc_addr *mptcp_local,
 
 	mptcp_for_each_bit_set(loc_bits, i) {
 		if (family == AF_INET &&
-		    (!if_idx || mptcp_local->locaddr4[i].if_idx == if_idx) &&
 		    mptcp_local->locaddr4[i].addr.s_addr == addr->in.s_addr) {
 			found = true;
 			break;
 		}
 		if (family == AF_INET6 &&
-		    (!if_idx || mptcp_local->locaddr6[i].if_idx == if_idx) &&
 		    ipv6_addr_equal(&mptcp_local->locaddr6[i].addr,
 				    &addr->in6)) {
 			found = true;
@@ -699,8 +693,7 @@ next_event:
 	mptcp_local = rcu_dereference_bh(fm_ns->local);
 
 	if (event->code == MPTCP_EVENT_DEL) {
-		id = mptcp_find_address(mptcp_local, event->family,
-					&event->addr, event->if_idx);
+		id = mptcp_find_address(mptcp_local, event->family, &event->addr);
 
 		/* Not in the list - so we don't care */
 		if (id < 0) {
@@ -722,8 +715,7 @@ next_event:
 		rcu_assign_pointer(fm_ns->local, mptcp_local);
 		kfree(old);
 	} else {
-		int i = mptcp_find_address(mptcp_local, event->family,
-					   &event->addr, event->if_idx);
+		int i = mptcp_find_address(mptcp_local, event->family, &event->addr);
 		int j = i;
 
 		if (j < 0) {
@@ -763,12 +755,10 @@ next_event:
 			mptcp_local->locaddr4[i].addr.s_addr = event->addr.in.s_addr;
 			mptcp_local->locaddr4[i].loc4_id = i + 1;
 			mptcp_local->locaddr4[i].low_prio = event->low_prio;
-			mptcp_local->locaddr4[i].if_idx = event->if_idx;
 		} else {
 			mptcp_local->locaddr6[i].addr = event->addr.in6;
 			mptcp_local->locaddr6[i].loc6_id = i + MPTCP_MAX_ADDR;
 			mptcp_local->locaddr6[i].low_prio = event->low_prio;
-			mptcp_local->locaddr6[i].if_idx = event->if_idx;
 		}
 
 		if (j < 0) {
@@ -1023,7 +1013,6 @@ static void addr4_event_handler(const struct in_ifaddr *ifa, unsigned long event
 	mpevent.family = AF_INET;
 	mpevent.addr.in.s_addr = ifa->ifa_local;
 	mpevent.low_prio = (netdev->flags & IFF_MPBACKUP) ? 1 : 0;
-	mpevent.if_idx  = netdev->ifindex;
 
 	if (event == NETDEV_DOWN || !netif_running(netdev) ||
 	    (netdev->flags & IFF_NOMULTIPATH) || !(netdev->flags & IFF_UP))
@@ -1147,7 +1136,6 @@ static void addr6_event_handler(const struct inet6_ifaddr *ifa, unsigned long ev
 	mpevent.family = AF_INET6;
 	mpevent.addr.in6 = ifa->addr;
 	mpevent.low_prio = (netdev->flags & IFF_MPBACKUP) ? 1 : 0;
-	mpevent.if_idx = netdev->ifindex;
 
 	if (event == NETDEV_DOWN || !netif_running(netdev) ||
 	    (netdev->flags & IFF_NOMULTIPATH) || !(netdev->flags & IFF_UP))
@@ -1248,7 +1236,7 @@ static void full_mesh_new_session(const struct sock *meta_sk)
 	struct fullmesh_priv *fmp = fullmesh_get_priv(mpcb);
 	const struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(meta_sk));
 	struct tcp_sock *master_tp = tcp_sk(mpcb->master_sk);
-	int i, index, if_idx;
+	int i, index;
 	union inet_addr saddr, daddr;
 	sa_family_t family;
 	bool meta_v4 = meta_sk->sk_family == AF_INET;
@@ -1257,13 +1245,11 @@ static void full_mesh_new_session(const struct sock *meta_sk)
 	if (meta_sk->sk_family == AF_INET || mptcp_v6_is_v4_mapped(meta_sk)) {
 		saddr.ip = inet_sk(meta_sk)->inet_saddr;
 		daddr.ip = inet_sk(meta_sk)->inet_daddr;
-		if_idx = mpcb->master_sk->sk_bound_dev_if;
 		family = AF_INET;
 #if IS_ENABLED(CONFIG_IPV6)
 	} else {
 		saddr.in6 = inet6_sk(meta_sk)->saddr;
 		daddr.in6 = meta_sk->sk_v6_daddr;
-		if_idx = mpcb->master_sk->sk_bound_dev_if;
 		family = AF_INET6;
 #endif
 	}
@@ -1271,7 +1257,7 @@ static void full_mesh_new_session(const struct sock *meta_sk)
 	rcu_read_lock();
 	mptcp_local = rcu_dereference(fm_ns->local);
 
-	index = mptcp_find_address(mptcp_local, family, &saddr, if_idx);
+	index = mptcp_find_address(mptcp_local, family, &saddr);
 	if (index < 0)
 		goto fallback;
 
@@ -1297,9 +1283,7 @@ static void full_mesh_new_session(const struct sock *meta_sk)
 		__be32 ifa_address = mptcp_local->locaddr4[i].addr.s_addr;
 
 		/* We do not need to announce the initial subflow's address again */
-		if (family == AF_INET &&
-		    (!if_idx || mptcp_local->locaddr4[i].if_idx == if_idx) &&
-		    saddr.ip == ifa_address)
+		if (family == AF_INET && saddr.ip == ifa_address)
 			continue;
 
 		fmp->add_addr++;
@@ -1316,9 +1300,7 @@ skip_ipv4:
 		const struct in6_addr *ifa6 = &mptcp_local->locaddr6[i].addr;
 
 		/* We do not need to announce the initial subflow's address again */
-		if (family == AF_INET6 &&
-		    (!if_idx || mptcp_local->locaddr6[i].if_idx == if_idx) &&
-		    ipv6_addr_equal(&saddr.in6, ifa6))
+		if (family == AF_INET6 && ipv6_addr_equal(&saddr.in6, ifa6))
 			continue;
 
 		fmp->add_addr++;
@@ -1519,7 +1501,7 @@ static int full_mesh_get_local_id(sa_family_t family, union inet_addr *addr,
 	rcu_read_lock();
 	mptcp_local = rcu_dereference(fm_ns->local);
 
-	index = mptcp_find_address(mptcp_local, family, addr, 0);
+	index = mptcp_find_address(mptcp_local, family, addr);
 
 	if (index != -1) {
 		if (family == AF_INET) {
@@ -1565,10 +1547,7 @@ static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 	/* IPv4 */
 	unannouncedv4 = (~fmp->announced_addrs_v4) & mptcp_local->loc4_bits;
 	if (unannouncedv4 &&
-	    ((mpcb->mptcp_ver == MPTCP_VERSION_0 &&
-	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR4_ALIGN) ||
-	    (mpcb->mptcp_ver >= MPTCP_VERSION_1 &&
-	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR4_ALIGN_VER1))) {
+	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR4_ALIGN) {
 		int ind = mptcp_find_free_index(~unannouncedv4);
 
 		opts->options |= OPTION_MPTCP;
@@ -1576,40 +1555,22 @@ static void full_mesh_addr_signal(struct sock *sk, unsigned *size,
 		opts->add_addr4.addr_id = mptcp_local->locaddr4[ind].loc4_id;
 		opts->add_addr4.addr = mptcp_local->locaddr4[ind].addr;
 		opts->add_addr_v4 = 1;
-		if (mpcb->mptcp_ver >= MPTCP_VERSION_1) {
-			u8 mptcp_hash_mac[20];
-			u8 no_key[8];
-
-			*(u64 *)no_key = 0;
-			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_loc_key,
-					(u8 *)no_key,
-					(u32 *)mptcp_hash_mac, 2,
-					1, (u8 *)&mptcp_local->locaddr4[ind].loc4_id,
-					4, (u8 *)&opts->add_addr4.addr.s_addr);
-			opts->add_addr4.trunc_mac = *(u64 *)mptcp_hash_mac;
-		}
 
 		if (skb) {
 			fmp->announced_addrs_v4 |= (1 << ind);
 			fmp->add_addr--;
 		}
-
-		if (mpcb->mptcp_ver < MPTCP_VERSION_1)
-			*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN;
-		if (mpcb->mptcp_ver >= MPTCP_VERSION_1)
-			*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN_VER1;
+		*size += MPTCP_SUB_LEN_ADD_ADDR4_ALIGN;
 	}
 
 	if (meta_v4)
 		goto skip_ipv6;
+
 skip_ipv4:
 	/* IPv6 */
 	unannouncedv6 = (~fmp->announced_addrs_v6) & mptcp_local->loc6_bits;
 	if (unannouncedv6 &&
-	    ((mpcb->mptcp_ver == MPTCP_VERSION_0 &&
-	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR6_ALIGN) ||
-	    (mpcb->mptcp_ver >= MPTCP_VERSION_1 &&
-	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR6_ALIGN_VER1))) {
+	    MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_ADD_ADDR6_ALIGN) {
 		int ind = mptcp_find_free_index(~unannouncedv6);
 
 		opts->options |= OPTION_MPTCP;
@@ -1617,27 +1578,12 @@ skip_ipv4:
 		opts->add_addr6.addr_id = mptcp_local->locaddr6[ind].loc6_id;
 		opts->add_addr6.addr = mptcp_local->locaddr6[ind].addr;
 		opts->add_addr_v6 = 1;
-		if (mpcb->mptcp_ver >= MPTCP_VERSION_1) {
-			u8 mptcp_hash_mac[20];
-			u8 no_key[8];
-
-			*(u64 *)no_key = 0;
-			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_loc_key,
-					(u8 *)no_key,
-					(u32 *)mptcp_hash_mac, 2,
-					1, (u8 *)&mptcp_local->locaddr6[ind].loc6_id,
-					16, (u8 *)&opts->add_addr6.addr.s6_addr);
-			opts->add_addr6.trunc_mac = *(u64 *)mptcp_hash_mac;
-		}
 
 		if (skb) {
 			fmp->announced_addrs_v6 |= (1 << ind);
 			fmp->add_addr--;
 		}
-		if (mpcb->mptcp_ver < MPTCP_VERSION_1)
-			*size += MPTCP_SUB_LEN_ADD_ADDR6_ALIGN;
-		if (mpcb->mptcp_ver >= MPTCP_VERSION_1)
-			*size += MPTCP_SUB_LEN_ADD_ADDR6_ALIGN_VER1;
+		*size += MPTCP_SUB_LEN_ADD_ADDR6_ALIGN;
 	}
 
 skip_ipv6:
